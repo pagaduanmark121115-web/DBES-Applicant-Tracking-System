@@ -84,7 +84,3 @@ for col, vic in zip(cols, vicariates):
             st.caption("No schools added yet.")
 
 st.divider()
-st.caption(
-    "Default admin login is username `admin` / password `changeme123` — "
-    "change this immediately from the My Account page."
-)
