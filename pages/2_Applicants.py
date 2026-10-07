@@ -1,3 +1,5 @@
+from datetime import date
+
 import streamlit as st
 import pandas as pd
 
@@ -104,6 +106,104 @@ def _requirements_fields(current_statuses, key_prefix):
             label, options, index=index, horizontal=True, key=f"{key_prefix}_req_{key}"
         )
     return values
+
+
+TRAINING_COLS = [
+    "Title of training / seminar", "Organizer / provider", "Date from", "Date to",
+    "Hours", "Certificate on file", "Remarks",
+]
+
+
+def _trainings_df(trainings):
+    """Saved trainings -> DataFrame for the table editor."""
+    data = [
+        {
+            TRAINING_COLS[0]: t["title"],
+            TRAINING_COLS[1]: t["organizer"] or "",
+            TRAINING_COLS[2]: utils.parse_date(t["date_from"]),
+            TRAINING_COLS[3]: utils.parse_date(t["date_to"]),
+            TRAINING_COLS[4]: t["hours"],
+            TRAINING_COLS[5]: bool(t["certificate_on_file"]),
+            TRAINING_COLS[6]: t["remarks"] or "",
+        }
+        for t in trainings
+    ]
+    df = pd.DataFrame(data, columns=TRAINING_COLS)
+    df[TRAINING_COLS[2]] = pd.to_datetime(df[TRAINING_COLS[2]])
+    df[TRAINING_COLS[3]] = pd.to_datetime(df[TRAINING_COLS[3]])
+    df[TRAINING_COLS[4]] = pd.to_numeric(df[TRAINING_COLS[4]]).astype(float)
+    df[TRAINING_COLS[5]] = df[TRAINING_COLS[5]].astype(bool)
+    return df
+
+
+def _trainings_editor(df, key):
+    """Spreadsheet-style table: click the blank row at the bottom to add a
+    training; select a row and press Delete to remove one."""
+    return st.data_editor(
+        df, key=key, num_rows="dynamic", use_container_width=True, hide_index=True,
+        column_config={
+            TRAINING_COLS[0]: st.column_config.TextColumn(width="large"),
+            TRAINING_COLS[1]: st.column_config.TextColumn(),
+            TRAINING_COLS[2]: st.column_config.DateColumn(format="YYYY-MM-DD"),
+            TRAINING_COLS[3]: st.column_config.DateColumn(format="YYYY-MM-DD"),
+            TRAINING_COLS[4]: st.column_config.NumberColumn(min_value=0, step=0.5),
+            TRAINING_COLS[5]: st.column_config.CheckboxColumn(default=False),
+            TRAINING_COLS[6]: st.column_config.TextColumn(),
+        },
+    )
+
+
+def _blank(value):
+    return None if (value is None or pd.isna(value)) else value
+
+
+def _collect_training_rows(edited_df):
+    """Edited table -> (rows ready for the DB, list of error messages).
+    Completely empty rows are ignored."""
+    rows, errors = [], []
+    for n, (_, r) in enumerate(edited_df.iterrows(), start=1):
+        title = str(_blank(r[TRAINING_COLS[0]]) or "").strip()
+        organizer = str(_blank(r[TRAINING_COLS[1]]) or "").strip()
+        d_from = _blank(r[TRAINING_COLS[2]])
+        d_to = _blank(r[TRAINING_COLS[3]])
+        hours = _blank(r[TRAINING_COLS[4]])
+        cert = bool(_blank(r[TRAINING_COLS[5]]))
+        remarks = str(_blank(r[TRAINING_COLS[6]]) or "").strip()
+
+        if not (title or organizer or d_from is not None or d_to is not None or hours or cert or remarks):
+            continue  # untouched blank row
+        if not title:
+            errors.append(f"Trainings table, row {n}: please enter the title.")
+            continue
+        if d_from is None:
+            errors.append(f"Trainings table, row {n} ('{title}'): please enter the date (from).")
+            continue
+        d_from = pd.Timestamp(d_from).date()
+        d_to = pd.Timestamp(d_to).date() if d_to is not None else None
+        if d_to and d_to < d_from:
+            errors.append(f"Trainings table, row {n} ('{title}'): the end date is earlier than the start date.")
+            continue
+        rows.append({
+            "title": title,
+            "organizer": organizer or None,
+            "date_from": d_from.isoformat(),
+            "date_to": d_to.isoformat() if d_to else None,
+            "hours": float(hours) if hours else None,
+            "certificate_on_file": cert,
+            "remarks": remarks or None,
+        })
+    return rows, errors
+
+
+def _split_trainings(trainings):
+    """(within the past three years, older than three years), judged by the
+    training's end date, or its start date if it has no end date."""
+    cutoff = db.training_cutoff()
+    recent, older = [], []
+    for t in trainings:
+        when = utils.parse_date(t["date_to"] or t["date_from"])
+        (recent if (when and when >= cutoff) else older).append(t)
+    return recent, older
 
 
 # ============================================================
@@ -343,6 +443,14 @@ with tab_list:
                 done, total = db.requirements_progress(saved_statuses)
                 st.progress(done / total if total else 0.0, text=f"{done} of {total} applicable requirements submitted")
 
+                _recent_t, _ = _split_trainings(db.list_applicant_trainings(app_id))
+                _certs = [t for t in _recent_t if t["certificate_on_file"]]
+                if _certs and saved_statuses.get("trainings") != db.REQ_SUBMITTED:
+                    st.info(
+                        f"{len(_certs)} training certificate(s) from the past three years are encoded, but "
+                        "the 'Certificates of Training and Seminar attended' item is not marked Submitted yet."
+                    )
+
                 with st.form(f"req_form_{app_id}"):
                     new_statuses = _requirements_fields(saved_statuses, key_prefix=f"edit_{app_id}")
                     save_reqs = st.form_submit_button("💾 Save checklist")
@@ -351,71 +459,48 @@ with tab_list:
                     st.success("Checklist saved.")
                     st.rerun()
 
-            with st.expander("🎓 Trainings & Seminars Attended", expanded=False):
+            with st.expander("🎓 Trainings & Seminars Attended (past 3 years)", expanded=False):
+                cutoff = db.training_cutoff()
                 st.caption(
-                    "Encode each training or seminar the applicant attended (the checklist asks for "
-                    "certificates from the past three years)."
+                    "Encode each training or seminar certificate the applicant submitted. The requirement "
+                    f"covers the past three years — that is, from {cutoff.strftime('%B %d, %Y')} up to today."
                 )
-                trainings = db.list_applicant_trainings(app_id)
-                if not trainings:
-                    st.caption("No trainings encoded yet.")
-                else:
-                    st.markdown(f"**{len(trainings)} training(s) encoded**")
-                    for t in trainings:
-                        with st.container(border=True):
-                            tc1, tc2 = st.columns([5, 1])
-                            with tc1:
-                                st.write(f"**{t['title']}**")
-                                details = []
-                                if t["organizer"]:
-                                    details.append(f"Organizer: {t['organizer']}")
-                                if t["date_from"] and t["date_to"] and t["date_to"] != t["date_from"]:
-                                    details.append(f"{t['date_from']} to {t['date_to']}")
-                                elif t["date_from"]:
-                                    details.append(t["date_from"])
-                                if t["hours"]:
-                                    details.append(f"{t['hours']:g} hour(s)")
-                                details.append(
-                                    "Certificate on file ✅" if t["certificate_on_file"]
-                                    else "Certificate not yet submitted"
-                                )
-                                st.caption(" · ".join(details))
-                                if t["remarks"]:
-                                    st.caption(f"Remarks: {t['remarks']}")
-                            with tc2:
-                                if st.button("🗑️ Delete", key=f"del_training_{t['id']}"):
-                                    db.delete_applicant_training(t["id"], deleted_by=current_user)
-                                    st.rerun()
+                saved_trainings = db.list_applicant_trainings(app_id)
+                recent_t, older_t = _split_trainings(saved_trainings)
 
-                st.markdown("---")
-                st.markdown("**Add a training / seminar**")
-                with st.form(f"training_form_{app_id}", clear_on_submit=True):
-                    t_title = st.text_input("Title of training / seminar*")
-                    t_organizer = st.text_input("Organizer / provider")
-                    td1, td2, td3 = st.columns(3)
-                    with td1:
-                        t_from = st.date_input("Date (from)", value=None, key=f"tr_from_{app_id}")
-                    with td2:
-                        t_to = st.date_input("Date (to, if multi-day)", value=None, key=f"tr_to_{app_id}")
-                    with td3:
-                        t_hours = st.number_input("Number of hours", min_value=0.0, step=1.0, value=0.0)
-                    t_cert = st.checkbox("Certificate submitted / on file")
-                    t_remarks = st.text_input("Remarks")
-                    add_training = st.form_submit_button("➕ Add training")
-                if add_training:
-                    if not t_title.strip():
-                        st.error("Please enter the title of the training or seminar.")
-                    elif t_from and t_to and t_to < t_from:
-                        st.error("The end date can't be earlier than the start date.")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Encoded", len(saved_trainings))
+                m2.metric("Within past 3 years", len(recent_t))
+                m3.metric("With certificate on file (past 3 yrs)",
+                          sum(1 for t in recent_t if t["certificate_on_file"]))
+                if older_t:
+                    st.warning(
+                        f"{len(older_t)} entr{'y is' if len(older_t) == 1 else 'ies are'} older than three years "
+                        "and won't count toward the requirement: "
+                        + "; ".join(f"{t['title']} ({t['date_from']})" for t in older_t)
+                    )
+
+                st.markdown(
+                    "**How to use the table:** click the empty row at the bottom to add a training. "
+                    "To remove one, tick the box at the far left of its row and press **Delete** on your keyboard. "
+                    "Click **Save trainings** when you're done."
+                )
+                ver_key = f"tr_ver_{app_id}"
+                ver = st.session_state.get(ver_key, 0)
+                with st.form(f"trainings_form_{app_id}"):
+                    edited_trainings = _trainings_editor(
+                        _trainings_df(saved_trainings), key=f"trainings_editor_{app_id}_{ver}"
+                    )
+                    save_trainings = st.form_submit_button("💾 Save trainings")
+                if save_trainings:
+                    new_rows, row_errors = _collect_training_rows(edited_trainings)
+                    if row_errors:
+                        for err in row_errors:
+                            st.error(err)
                     else:
-                        db.add_applicant_training(
-                            app_id, t_title.strip(), t_organizer.strip() or None,
-                            t_from.isoformat() if t_from else None,
-                            t_to.isoformat() if t_to else None,
-                            t_hours or None, t_cert, t_remarks.strip() or None,
-                            added_by=current_user,
-                        )
-                        st.success("Training added.")
+                        db.replace_applicant_trainings(app_id, new_rows, changed_by=current_user)
+                        st.session_state[ver_key] = ver + 1
+                        st.success(f"Saved {len(new_rows)} training(s).")
                         st.rerun()
 
             with st.expander("📅 Stage Dates, Person-in-Charge & Notes", expanded=False):
@@ -530,14 +615,27 @@ with tab_add:
             st.markdown("**Requirements checklist** _(mark what has been submitted so far)_")
             new_req_statuses = _requirements_fields(None, key_prefix="add")
 
+            st.markdown(
+                "**Trainings and seminars attended — past three years** "
+                f"_(from {db.training_cutoff().strftime('%B %d, %Y')} to today; click the empty row to add a line)_"
+            )
+            add_ver = st.session_state.get("add_tr_ver", 0)
+            new_trainings_edited = _trainings_editor(
+                _trainings_df([]), key=f"add_trainings_editor_{add_ver}"
+            )
+
             notes = st.text_area("General notes")
             submitted = st.form_submit_button("➕ Add applicant")
 
         if submitted:
+            training_rows, training_errors = _collect_training_rows(new_trainings_edited)
             if not (first_name and last_name and position_applied_for):
                 st.error("First name, last name, and position applied for are required.")
             elif not specialization:
                 st.error("Please provide a Major (Teaching) or Specialization/Role (Non-Teaching).")
+            elif training_errors:
+                for err in training_errors:
+                    st.error(err)
             else:
                 school_match = next(s for s in schools_all if s["name"] == school_choice)
                 new_applicant_data = {
@@ -558,7 +656,7 @@ with tab_add:
                 new_applicant_data.update(_normalize_stage_values(raw_stage_values))
                 new_id = db.add_applicant(new_applicant_data, created_by=current_user)
                 db.set_requirement_statuses(new_id, new_req_statuses, changed_by=current_user)
-                st.success(
-                    f"Added {first_name} {last_name}. Encode their trainings and seminars from "
-                    "View / Edit Applicants → Trainings & Seminars Attended."
-                )
+                if training_rows:
+                    db.replace_applicant_trainings(new_id, training_rows, changed_by=current_user)
+                st.session_state["add_tr_ver"] = add_ver + 1
+                st.success(f"Added {first_name} {last_name}.")

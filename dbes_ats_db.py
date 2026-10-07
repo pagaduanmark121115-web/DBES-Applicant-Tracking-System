@@ -907,3 +907,44 @@ def delete_applicant_training(training_id: int, deleted_by="admin"):
     if row:
         log_action(deleted_by, None, "DELETE_TRAINING", "applicant_training", training_id,
                    f"Deleted training '{row['title']}' for applicant #{row['applicant_id']}")
+
+
+# ---------- Three-year rule for trainings and seminars ----------
+
+TRAINING_LOOKBACK_YEARS = 3
+
+
+def training_cutoff(today=None):
+    """Earliest date a training can have and still count toward the
+    'past three years' requirement."""
+    today = today or date.today()
+    try:
+        return today.replace(year=today.year - TRAINING_LOOKBACK_YEARS)
+    except ValueError:  # Feb 29 -> Feb 28
+        return today.replace(year=today.year - TRAINING_LOOKBACK_YEARS, day=28)
+
+
+def replace_applicant_trainings(applicant_id: int, rows, changed_by="admin"):
+    """Replace the applicant's whole trainings list with `rows` (list of
+    dicts: title, organizer, date_from, date_to, hours, certificate_on_file,
+    remarks). The table editor on the page always submits the complete
+    current list, so delete-then-insert is the simplest safe approach."""
+    now = datetime.now().isoformat(timespec="seconds")
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM applicant_trainings WHERE applicant_id = ?", (applicant_id,))
+        for r in rows:
+            conn.execute(
+                """INSERT INTO applicant_trainings
+                   (applicant_id, title, organizer, date_from, date_to, hours,
+                    certificate_on_file, remarks, added_by, added_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (applicant_id, r["title"], r.get("organizer"), r.get("date_from"),
+                 r.get("date_to"), r.get("hours"), int(bool(r.get("certificate_on_file"))),
+                 r.get("remarks"), changed_by, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    log_action(changed_by, None, "UPDATE_TRAININGS", "applicant", applicant_id,
+               f"Trainings list saved ({len(rows)} entries)")
