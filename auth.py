@@ -1,7 +1,8 @@
 """
 auth.py
 Login form and session-state helpers for role-based access
-(admin vs. school-level user). Login attempts are recorded to the audit log.
+(HR Officer vs. school-scoped users — School Principal and Delegated by
+School Principal). Login attempts are recorded to the audit log.
 """
 
 import streamlit as st
@@ -40,6 +41,9 @@ def login_form():
 
 
 def require_login():
+    # Make sure every table (including newly added ones) exists even if this
+    # page is opened directly instead of through the main page.
+    db.init_db()
     if not st.session_state.get("authenticated"):
         st.warning("Please log in from the main page first.")
         st.stop()
@@ -55,7 +59,7 @@ def require_admin():
 def logout_button():
     with st.sidebar:
         st.markdown(f"**Logged in as:** {st.session_state.get('full_name')}")
-        st.caption(f"Role: {st.session_state.get('role')}")
+        st.caption(f"Role: {db.role_label(st.session_state.get('role'))}")
         if st.button("Log out"):
             db.log_action(st.session_state.get("username"), st.session_state.get("role"), "LOGOUT")
             for key in ["authenticated", "user_id", "username", "full_name", "role", "school_id"]:
@@ -64,7 +68,9 @@ def logout_button():
 
 
 def current_scope():
-    """Admin -> (None, None) no restriction. School-level -> (school_id, None)."""
+    """HR Officer (role 'admin') -> (None, None), no restriction.
+    Any school-scoped role (School Principal or Delegated by School
+    Principal) -> (school_id, None)."""
     if st.session_state.get("role") == "admin":
         return None, None
     return st.session_state.get("school_id"), None
